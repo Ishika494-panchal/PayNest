@@ -2,6 +2,11 @@
 
 ## PayNest – AI-Powered Income Protection for Gig Workers
 
+# Pitch Deck
+https://drive.google.com/file/d/15XWvz6HtAsgM5yVFfO-Or_JBz3V13iGn/view?usp=sharing
+
+# Project Preview
+https://paynest-u23g.onrender.com/
 ---
 
 # 2. Overview
@@ -280,3 +285,4 @@ Login -> Profile -> AI Pricing -> Plan Selection -> Payment -> Monitoring -> Dis
 
 PayNest transforms traditional insurance into an AI-assisted, automation-first safety net for gig workers.  
 It combines affordability, real-time intelligence, and transparent payout logic to provide practical financial protection during unpredictable disruptions.
+
