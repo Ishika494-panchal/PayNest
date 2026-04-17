@@ -18,7 +18,8 @@ function AuthPage({ isLoggedIn, userName, onAuthSuccess }) {
   const handleLogin = async (payload) => {
     const result = await login(payload)
     onAuthSuccess(result)
-    navigate('/')
+    const isAdmin = Boolean(result?.user?.role === 'admin' || result?.role === 'admin')
+    navigate(isAdmin ? '/admin' : '/')
   }
 
   return (

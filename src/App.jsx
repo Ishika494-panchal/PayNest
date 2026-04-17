@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import ActivitiesPage from './pages/ActivitiesPage'
+import AdminDashboardPage from './pages/AdminDashboardPage'
 import AuthPage from './pages/AuthPage'
 import CheckoutPage from './pages/CheckoutPage'
 import ClaimsHistoryPage from './pages/ClaimsHistoryPage'
@@ -11,9 +12,10 @@ import PlanSelectionPage from './pages/PlanSelectionPage'
 import RewardsPage from './pages/RewardsPage'
 import SettingsPage from './pages/SettingsPage'
 import UserDetailsPage from './pages/UserDetailsPage'
-import { ApiError, getCurrentUser, logout as logoutApi } from './lib/api'
+import { ApiError, getAdminMe, getCurrentUser, logout as logoutApi } from './lib/api'
 
 const USER_SNAPSHOT_KEY = 'paynest_user_snapshot'
+const ADMIN_SESSION_KEY = 'paynest_admin_session'
 
 export default function App() {
   return (
@@ -25,9 +27,13 @@ export default function App() {
 
 function AppRoutes() {
   const [authToken, setAuthToken] = useState(() => localStorage.getItem('paynest_auth_token') || '')
+  const [adminToken, setAdminToken] = useState(() => localStorage.getItem('paynest_admin_token') || '')
   const [authUser, setAuthUser] = useState(null)
+  const [adminSession, setAdminSession] = useState(null)
   const [isAuthChecking, setIsAuthChecking] = useState(true)
+  const [isAdminChecking, setIsAdminChecking] = useState(true)
   const isLoggedIn = Boolean(authToken && authUser)
+  const isAdminLoggedIn = Boolean(adminToken && adminSession)
 
   useEffect(() => {
     if (!authToken || !authUser) return
@@ -106,7 +112,83 @@ function AppRoutes() {
     }
   }, [authToken])
 
-  const handleAuthSuccess = ({ token, user }) => {
+  useEffect(() => {
+    let mounted = true
+    const hydrateAdmin = async () => {
+      if (!adminToken) {
+        if (mounted) {
+          setAdminSession(null)
+          setIsAdminChecking(false)
+        }
+        return
+      }
+      try {
+        const result = await getAdminMe(adminToken)
+        if (mounted) {
+          setAdminSession(result.admin || null)
+          setIsAdminChecking(false)
+        }
+      } catch (e) {
+        const status = e instanceof ApiError ? e.status : 0
+        if (!mounted) return
+        if (status === 401) {
+          localStorage.removeItem('paynest_admin_token')
+          try {
+            sessionStorage.removeItem(ADMIN_SESSION_KEY)
+          } catch {
+            /* ignore */
+          }
+          setAdminToken('')
+          setAdminSession(null)
+        }
+        setIsAdminChecking(false)
+      }
+    }
+    hydrateAdmin()
+    return () => {
+      mounted = false
+    }
+  }, [adminToken])
+
+  useEffect(() => {
+    if (!adminToken || !adminSession) return
+    try {
+      sessionStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(adminSession))
+    } catch {
+      /* ignore */
+    }
+  }, [adminToken, adminSession])
+
+  const handleAuthSuccess = (result) => {
+    const token = result?.token || ''
+    const adminUser = result?.user?.role === 'admin' ? result.user : result?.admin || null
+    const user = result?.user || null
+    const isAdmin = Boolean(adminUser)
+    if (isAdmin) {
+      localStorage.removeItem('paynest_auth_token')
+      try {
+        sessionStorage.removeItem(USER_SNAPSHOT_KEY)
+      } catch {
+        /* ignore */
+      }
+      setAuthToken('')
+      setAuthUser(null)
+
+      localStorage.setItem('paynest_admin_token', token)
+      setAdminToken(token)
+      setAdminSession(adminUser)
+      return
+    }
+
+    localStorage.removeItem('paynest_admin_token')
+    try {
+      sessionStorage.removeItem(ADMIN_SESSION_KEY)
+    } catch {
+      /* ignore */
+    }
+    setAdminToken('')
+    setAdminSession(null)
+
     localStorage.setItem('paynest_auth_token', token)
     setAuthToken(token)
     setAuthUser(user)
@@ -136,20 +218,50 @@ function AppRoutes() {
     setAuthUser(null)
   }
 
-  if (isAuthChecking) {
+  const handleAdminLogout = async () => {
+    try {
+      if (adminToken) await logoutApi(adminToken)
+    } catch {
+      /* clear local admin session regardless */
+    }
+    localStorage.removeItem('paynest_admin_token')
+    try {
+      sessionStorage.removeItem(ADMIN_SESSION_KEY)
+    } catch {
+      /* ignore */
+    }
+    setAdminToken('')
+    setAdminSession(null)
+  }
+
+  if (isAuthChecking || isAdminChecking) {
     return <div className="grid min-h-screen place-items-center bg-[#f4f2ee] text-[#5f6673]">Loading...</div>
   }
 
   const requireAuth = (element) => (isLoggedIn ? element : <Navigate to="/login" replace />)
+  const requireAdminAuth = (element) => (isAdminLoggedIn ? element : <Navigate to="/login" replace />)
   const requireCompletedProfile = (element) =>
     isLoggedIn && !authUser?.profileCompleted ? <Navigate to="/userdetails" replace /> : element
 
   return (
     <Routes>
+        <Route path="/admin/login" element={<Navigate to="/login" replace />} />
+        <Route
+          path="/admin"
+          element={requireAdminAuth(
+            <AdminDashboardPage
+              admin={adminSession}
+              adminToken={adminToken}
+              onAdminLogout={handleAdminLogout}
+            />
+          )}
+        />
         <Route
           path="/"
           element={
-            isLoggedIn && !authUser?.profileCompleted ? (
+            isAdminLoggedIn ? (
+              <Navigate to="/admin" replace />
+            ) : isLoggedIn && !authUser?.profileCompleted ? (
               <Navigate to="/userdetails" replace />
             ) : (
               <LandingPage
@@ -163,7 +275,9 @@ function AppRoutes() {
         <Route
           path="/login"
           element={
-            isLoggedIn ? (
+            isAdminLoggedIn ? (
+              <Navigate to="/admin" replace />
+            ) : isLoggedIn ? (
               <Navigate to="/" replace />
             ) : (
               <AuthPage
@@ -256,7 +370,12 @@ function AppRoutes() {
           path="/rewards"
           element={requireAuth(
             requireCompletedProfile(
-              <RewardsPage userName={authUser?.name || ''} onLogout={handleLogout} />
+              <RewardsPage
+                userName={authUser?.name || ''}
+                token={authToken}
+                user={authUser}
+                onLogout={handleLogout}
+              />
             )
           )}
         />

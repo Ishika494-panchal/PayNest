@@ -40,20 +40,20 @@ function ClaimsHistoryPage({ userName, onLogout, token }) {
   const planTitle = summary?.selectedPlan?.title || null
 
   return (
-    <div className="min-h-screen bg-[#f5f3ee]">
+    <div className="min-h-screen overflow-x-hidden bg-[#f5f3ee]">
       <DashboardTopNav userName={userName} onLogout={onLogout} />
       <div className="flex min-h-[calc(100vh-72px)]">
         <DashboardSidebar onLogout={onLogout} />
 
-        <div className="flex flex-1 flex-col">
-          <main className="flex justify-center px-6 pb-12 pt-10 lg:px-8">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <main className="flex justify-center px-4 pb-12 pt-6 sm:px-6 sm:pt-8 lg:px-8 lg:pt-10">
             <section className="w-full max-w-[640px]">
               <div className="flex items-start gap-4">
                 <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-[#e8e4da] text-[#5c5644]">
                   <History className="h-6 w-6" strokeWidth={1.8} />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <h1 className="text-[34px] font-semibold leading-tight text-[#1f252f] sm:text-[40px]">
+                  <h1 className="text-[30px] font-semibold leading-tight text-[#1f252f] sm:text-[34px] md:text-[40px]">
                     Claims history
                   </h1>
                   <p className="mt-2 text-[14px] leading-relaxed text-[#67707d]">
@@ -71,7 +71,7 @@ function ClaimsHistoryPage({ userName, onLogout, token }) {
                 </div>
               </div>
 
-              <div className="mt-8 rounded-[24px] border border-[#ece8df] bg-[#f7f5f0] p-6 shadow-[0_8px_20px_rgba(0,0,0,0.04)]">
+              <div className="mt-8 rounded-[24px] border border-[#ece8df] bg-[#f7f5f0] p-4 shadow-[0_8px_20px_rgba(0,0,0,0.04)] sm:p-6">
                 {error ? (
                   <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-800">
                     {error}
@@ -104,7 +104,7 @@ function ClaimsHistoryPage({ userName, onLogout, token }) {
                             </span>
                           </p>
                           {c.razorpayPayoutId ? (
-                            <p className="mt-0.5 font-mono text-[10px] text-[#9a9ca3]">
+                            <p className="mt-0.5 break-all font-mono text-[10px] text-[#9a9ca3]">
                               {c.razorpayPayoutId}
                             </p>
                           ) : null}
@@ -131,8 +131,8 @@ function ClaimsHistoryPage({ userName, onLogout, token }) {
           </div>
 
           <footer className="border-t border-[#ebe8e2]">
-            <div className="flex flex-col gap-4 px-6 py-5 text-[12px] text-[#676e79] md:flex-row md:items-center md:justify-between lg:px-8">
-              <div className="flex gap-6">
+            <div className="flex flex-col gap-4 px-4 py-5 text-[12px] text-[#676e79] md:flex-row md:items-center md:justify-between sm:px-6 lg:px-8">
+              <div className="flex flex-wrap gap-4 sm:gap-6">
                 <p className="font-semibold text-[#444c59]">PayNest AI</p>
                 <a href="#" className="hover:text-[#2f3640]">
                   Privacy Policy

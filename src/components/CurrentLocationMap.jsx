@@ -25,7 +25,7 @@ function requestLocation(onSuccess, onError, options) {
   navigator.geolocation.getCurrentPosition(onSuccess, onError, options)
 }
 
-export default function CurrentLocationMap() {
+export default function CurrentLocationMap({ onLocationResolved }) {
   const [position, setPosition] = useState(null)
   const [status, setStatus] = useState('loading')
   const [error, setError] = useState('')
@@ -33,9 +33,13 @@ export default function CurrentLocationMap() {
   useEffect(() => {
     requestLocation(
       (pos) => {
-        setPosition([pos.coords.latitude, pos.coords.longitude])
+        const next = [pos.coords.latitude, pos.coords.longitude]
+        setPosition(next)
         setStatus('ready')
         setError('')
+        if (typeof onLocationResolved === 'function') {
+          onLocationResolved({ latitude: next[0], longitude: next[1] })
+        }
       },
       (geoError) => {
         setStatus('error')
@@ -65,8 +69,12 @@ export default function CurrentLocationMap() {
               setError('')
               requestLocation(
                 (pos) => {
-                  setPosition([pos.coords.latitude, pos.coords.longitude])
+                  const next = [pos.coords.latitude, pos.coords.longitude]
+                  setPosition(next)
                   setStatus('ready')
+                  if (typeof onLocationResolved === 'function') {
+                    onLocationResolved({ latitude: next[0], longitude: next[1] })
+                  }
                 },
                 (geoError) => {
                   setStatus('error')

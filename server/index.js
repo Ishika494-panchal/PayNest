@@ -28,6 +28,10 @@ const API_NINJAS_KEY = process.env.API_NINJAS_KEY || ''
 const WEATHER_CACHE_TTL_MS = Number(process.env.WEATHER_CACHE_TTL_MS || 10 * 60 * 1000)
 const PRICING_CACHE_TTL_MS = Number(process.env.PRICING_CACHE_TTL_MS || 10 * 60 * 1000)
 const AQI_TIMEOUT_MS = Number(process.env.AQI_TIMEOUT_MS || 2500)
+const NO_CLAIM_RENEWAL_DISCOUNT_PERCENT = Math.max(
+  0,
+  Math.min(30, Number(process.env.PAYNEST_NO_CLAIM_DISCOUNT_PERCENT || 10))
+)
 const NOMINATIM_USER_AGENT =
   process.env.NOMINATIM_USER_AGENT || 'PayNest/1.0 (+https://paynest.app; support@paynest.app)'
 
@@ -39,13 +43,19 @@ const PRICE_MODEL_URL =
 const PRICE_MODEL_PREDICT_URL =
   String(process.env.PRICE_MODEL_PREDICT_URL || '').trim() ||
   `${String(PRICE_MODEL_URL).replace(/\/$/, '')}/predict-price`
-const _claimSimRaw = String(process.env.PAYNEST_CLAIM_SIMULATOR || '')
+const FRAUD_MODEL_PREDICT_URL =
+  String(process.env.FRAUD_MODEL_PREDICT_URL || '').trim() ||
+  'https://paynest-fraud-detection-model.onrender.com/predict'
+const FRAUD_MODEL_TIMEOUT_MS = Number(process.env.FRAUD_MODEL_TIMEOUT_MS || 9000)
+const FRAUD_BLOCK_SCORE_THRESHOLD = Math.max(
+  0,
+  Math.min(1, Number(process.env.FRAUD_BLOCK_SCORE_THRESHOLD || 0.6))
+)
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || 'admin@gmail.com')
   .trim()
-  .replace(/^["']|["']$/g, '')
-const CLAIM_SIMULATOR_ENABLED =
-  _claimSimRaw === '1' ||
-  _claimSimRaw.toLowerCase() === 'true' ||
-  _claimSimRaw.toLowerCase() === 'yes'
+  .toLowerCase()
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || 'admin@123').trim()
+const ADMIN_DISPLAY_NAME = String(process.env.ADMIN_DISPLAY_NAME || 'PayNest Admin').trim()
 
 function wmoWeatherCodeToLabels(code) {
   const c = Number(code)
@@ -343,6 +353,46 @@ async function nominatimGeocodeFirst(query) {
   }
 }
 
+async function nominatimReverseGeocodeLabel(latitude, longitude) {
+  const lat = Number(latitude)
+  const lon = Number(longitude)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return ''
+
+  const url = new URL('https://nominatim.openstreetmap.org/reverse')
+  url.searchParams.set('format', 'jsonv2')
+  url.searchParams.set('lat', String(lat))
+  url.searchParams.set('lon', String(lon))
+  url.searchParams.set('zoom', '12')
+  url.searchParams.set('addressdetails', '1')
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10000)
+  try {
+    const response = await fetch(url.toString(), {
+      headers: {
+        'User-Agent': NOMINATIM_USER_AGENT,
+        Accept: 'application/json',
+        'Accept-Language': 'en',
+      },
+      signal: controller.signal,
+    })
+    if (!response.ok) return ''
+    const data = await response.json().catch(() => ({}))
+    const addr = data?.address || {}
+    const cityLike =
+      addr.city || addr.town || addr.village || addr.municipality || addr.suburb || ''
+    const state = addr.state || ''
+    const country = addr.country || ''
+    const label = [cityLike, state, country].filter(Boolean).join(', ')
+    if (label) return label
+    return String(data?.display_name || '').trim()
+  } catch {
+    return ''
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
 async function geocodeCityName(city) {
   const q = String(city || '').trim()
   if (!q) throw new Error('City is required to fetch weather.')
@@ -463,6 +513,10 @@ const userSchema = new mongoose.Schema(
           razorpayOrderId: String,
           razorpayPaymentId: String,
           razorpaySignature: String,
+          basePremium: Number,
+          discountAmount: Number,
+          discountPercent: Number,
+          rewardSourceOrderId: String,
           amount: Number,
           currency: String,
           status: String,
@@ -471,6 +525,21 @@ const userSchema = new mongoose.Schema(
           paidAt: String,
         },
       ],
+      paymentIntents: [
+        {
+          razorpayOrderId: String,
+          basePremium: Number,
+          finalPremium: Number,
+          discountAmount: Number,
+          discountPercent: Number,
+          rewardSourceOrderId: String,
+          createdAt: String,
+        },
+      ],
+      rewards: {
+        lastDiscountSourceOrderId: String,
+        totalDiscountUsed: Number,
+      },
       dynamicPricing: {
         weeklyPrice: Number,
         riskScore: String,
@@ -490,7 +559,9 @@ const userSchema = new mongoose.Schema(
 const sessionSchema = new mongoose.Schema(
   {
     token: { type: String, required: true, unique: true, index: true },
-    userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, index: true },
+    role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
+    adminEmail: { type: String, default: '' },
   },
   { timestamps: true }
 )
@@ -529,12 +600,78 @@ function getSessionToken(req) {
   return authHeader.slice(7).trim()
 }
 
+function safeEqualText(a, b) {
+  const left = Buffer.from(String(a || ''))
+  const right = Buffer.from(String(b || ''))
+  if (left.length !== right.length) return false
+  return timingSafeEqual(left, right)
+}
+
 async function getUserFromToken(req) {
   const token = getSessionToken(req)
   if (!token) return null
   const session = await Session.findOne({ token })
   if (!session) return null
+  if (session.role === 'admin') return null
   return User.findById(session.userId)
+}
+
+async function getAdminSessionFromToken(req) {
+  const token = getSessionToken(req)
+  if (!token) return null
+  return Session.findOne({ token, role: 'admin' })
+}
+
+async function requireAdminSession(req, res) {
+  const session = await getAdminSessionFromToken(req)
+  if (!session) {
+    res.status(401).json({ message: 'Admin authentication required.' })
+    return null
+  }
+  return session
+}
+
+function buildAdminUserSummary(userDoc) {
+  const profileRaw = cloneProfilePlain(userDoc)
+  const profile = profileRaw && typeof profileRaw === 'object' ? profileRaw : {}
+  const claims = Array.isArray(profile.claims) ? profile.claims : []
+  const payments = Array.isArray(profile.payments) ? profile.payments : []
+  const subscription = getSubscriptionSnapshot(profile.subscription)
+  const latestClaim = [...claims].sort((a, b) => new Date(b?.createdAt || 0) - new Date(a?.createdAt || 0))[0] || null
+  const latestPayment = [...payments].sort((a, b) => new Date(b?.paidAt || 0) - new Date(a?.paidAt || 0))[0] || null
+
+  return {
+    id: String(userDoc._id),
+    name: userDoc.name || '',
+    email: userDoc.email || '',
+    passwordHash: userDoc.passwordHash || '',
+    profileCompleted: Boolean(userDoc.profileCompleted),
+    needsInitialPlanChoice: Boolean(userDoc.needsInitialPlanChoice),
+    city: profile.city || '',
+    workPlatform: profile.workPlatform || '',
+    dailyIncome: Number(profile.dailyIncome || 0),
+    claimsCount: claims.length,
+    paymentsCount: payments.length,
+    subscription,
+    latestClaim: latestClaim
+      ? {
+          triggerLabel: latestClaim.triggerLabel || latestClaim.trigger || 'N/A',
+          status: latestClaim.status || 'unknown',
+          amount: Number(latestClaim.amount || 0),
+          createdAt: latestClaim.createdAt || '',
+        }
+      : null,
+    latestPayment: latestPayment
+      ? {
+          amount: Number(latestPayment.amount || 0),
+          status: latestPayment.status || 'captured',
+          tier: latestPayment.tier || '',
+          paidAt: latestPayment.paidAt || '',
+        }
+      : null,
+    createdAt: userDoc.createdAt,
+    updatedAt: userDoc.updatedAt,
+  }
 }
 
 async function fetchWeatherByCity(city) {
@@ -788,6 +925,235 @@ function fallbackWeeklyPrice(areaRisk, pastDisruptions, aqi, rainfall) {
   return Math.min(70, Math.max(20, Math.round(base + areaWeight + disruptionsWeight + aqiWeight + rainWeight)))
 }
 
+function toFiniteNumber(v, fallback = null) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function haversineDistanceKm(lat1, lon1, lat2, lon2) {
+  const aLat = toFiniteNumber(lat1)
+  const aLon = toFiniteNumber(lon1)
+  const bLat = toFiniteNumber(lat2)
+  const bLon = toFiniteNumber(lon2)
+  if (![aLat, aLon, bLat, bLon].every((n) => Number.isFinite(n))) return null
+  const R = 6371
+  const dLat = ((bLat - aLat) * Math.PI) / 180
+  const dLon = ((bLon - aLon) * Math.PI) / 180
+  const aa =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((aLat * Math.PI) / 180) *
+      Math.cos((bLat * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2)
+  const c = 2 * Math.atan2(Math.sqrt(aa), Math.sqrt(1 - aa))
+  return R * c
+}
+
+function deriveActivityLevelFromWeather(weather) {
+  const rainMm = Number(weather?.rainMm ?? weather?.precipitationMm ?? 0) || 0
+  const windKmh = Number(weather?.windSpeed ?? weather?.dailyMaxWindKmh ?? 0) || 0
+  const aqi = Number(weather?.aqi ?? 0) || 0
+  if (rainMm >= 40 || windKmh >= 65 || aqi >= 250) return 0
+  if (rainMm >= 10 || windKmh >= 35 || aqi >= 150) return 1
+  return 2
+}
+
+function countCreditedClaims(claims) {
+  return (Array.isArray(claims) ? claims : []).reduce((sum, claim) => {
+    return String(claim?.status || '') === 'credited' ? sum + 1 : sum
+  }, 0)
+}
+
+function hoursSinceLastClaim(claims) {
+  const list = Array.isArray(claims) ? claims : []
+  const sorted = [...list]
+    .filter((c) => c?.createdAt)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+  if (!sorted.length) return 24 * 30
+  const lastMs = new Date(sorted[0].createdAt).getTime()
+  if (!Number.isFinite(lastMs)) return 24 * 30
+  const diffMs = Date.now() - lastMs
+  if (!Number.isFinite(diffMs) || diffMs < 0) return 0
+  return Number((diffMs / (1000 * 60 * 60)).toFixed(2))
+}
+
+async function resolveLocationMatch(profileCity, weather, currentLocation) {
+  const lat = toFiniteNumber(currentLocation?.latitude)
+  const lon = toFiniteNumber(currentLocation?.longitude)
+  // Fail-safe: if user live location is unavailable, do not treat as a match.
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return {
+      locationMatch: 0,
+      distanceKm: null,
+      resolvedFrom: 'missing-current-location',
+      expectedCoords: null,
+      actualCoords: null,
+      expectedLabel: String(profileCity || '').trim() || '',
+    }
+  }
+  const weatherLat = toFiniteNumber(weather?.latitude)
+  const weatherLon = toFiniteNumber(weather?.longitude)
+  if (Number.isFinite(weatherLat) && Number.isFinite(weatherLon)) {
+    const distanceKm = haversineDistanceKm(weatherLat, weatherLon, lat, lon)
+    if (Number.isFinite(distanceKm)) {
+      return {
+        locationMatch: distanceKm <= 30 ? 1 : 0,
+        distanceKm: Number(distanceKm.toFixed(2)),
+        resolvedFrom: 'weather-coordinates',
+        expectedCoords: { latitude: weatherLat, longitude: weatherLon },
+        actualCoords: { latitude: lat, longitude: lon },
+        expectedLabel: String(weather?.city || profileCity || '').trim(),
+      }
+    }
+  }
+  const city = String(profileCity || '').trim()
+  if (!city) {
+    return {
+      locationMatch: 0,
+      distanceKm: null,
+      resolvedFrom: 'missing-profile-city',
+      expectedCoords: null,
+      actualCoords: { latitude: lat, longitude: lon },
+      expectedLabel: '',
+    }
+  }
+  try {
+    const resolved = await geocodeCityName(city)
+    const distanceKm = haversineDistanceKm(resolved.latitude, resolved.longitude, lat, lon)
+    if (!Number.isFinite(distanceKm)) {
+      return {
+        locationMatch: 0,
+        distanceKm: null,
+        resolvedFrom: 'invalid-distance',
+        expectedCoords: { latitude: resolved.latitude, longitude: resolved.longitude },
+        actualCoords: { latitude: lat, longitude: lon },
+        expectedLabel: String(resolved.label || city),
+      }
+    }
+    return {
+      locationMatch: distanceKm <= 30 ? 1 : 0,
+      distanceKm: Number(distanceKm.toFixed(2)),
+      resolvedFrom: 'profile-city-geocode',
+      expectedCoords: { latitude: resolved.latitude, longitude: resolved.longitude },
+      actualCoords: { latitude: lat, longitude: lon },
+      expectedLabel: String(resolved.label || city),
+    }
+  } catch {
+    return {
+      locationMatch: 0,
+      distanceKm: null,
+      resolvedFrom: 'profile-city-geocode-failed',
+      expectedCoords: null,
+      actualCoords: { latitude: lat, longitude: lon },
+      expectedLabel: String(city || ''),
+    }
+  }
+}
+
+async function requestFraudPrediction(input) {
+  const payload = {
+    location_match: Number(input.location_match || 0),
+    activity_level: Number(input.activity_level || 0),
+    claims_count: Number(input.claims_count || 0),
+    time_gap_between_claims: Number(input.time_gap_between_claims || 0),
+  }
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), FRAUD_MODEL_TIMEOUT_MS)
+  try {
+    const response = await fetch(FRAUD_MODEL_PREDICT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      const raw = await response.text().catch(() => '')
+      throw new Error(raw || `Fraud model request failed with status ${response.status}`)
+    }
+    const data = await response.json().catch(() => ({}))
+    const resultLabel = String(data?.result ?? data?.label ?? '')
+      .trim()
+      .toLowerCase()
+    const fraudRaw = Number(
+      data?.fraud ??
+        data?.prediction ??
+        data?.is_fraud ??
+        (resultLabel === 'fraud' ? 1 : resultLabel === 'not fraud' ? 0 : 0)
+    )
+    const scoreRaw = Number(
+      data?.fraud_score ??
+        data?.score ??
+        data?.fraudProbability ??
+        data?.probability ??
+        data?.confidence ??
+        fraudRaw
+    )
+    const fraud = fraudRaw === 1 ? 1 : 0
+    // Some model variants return percentages (0..100) instead of probabilities (0..1).
+    const normalizedScore = Number.isFinite(scoreRaw)
+      ? scoreRaw > 1
+        ? scoreRaw / 100
+        : scoreRaw
+      : fraud
+    const fraudScore = Math.max(0, Math.min(1, normalizedScore))
+    return { fraud, fraudScore, raw: data, input: payload }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function evaluateClaimFraudRisk(user, weather, options = {}) {
+  const profile = cloneProfilePlain(user)
+  const claims = Array.isArray(profile.claims) ? profile.claims : []
+  const enteredCity = String(
+    profile.city || profile.weather?.city || weather?.city || options.enteredLocation || ''
+  ).trim()
+  const locationInfo = await resolveLocationMatch(enteredCity, weather, options.currentLocation)
+  const locationMatch = Number(locationInfo?.locationMatch || 0)
+  const activityLevel = Number.isFinite(Number(options.activityLevel))
+    ? Number(options.activityLevel)
+    : deriveActivityLevelFromWeather(weather)
+  const claimsCount = countCreditedClaims(claims)
+  const timeGapBetweenClaims = hoursSinceLastClaim(claims)
+  const fraudInput = {
+    location_match: locationMatch,
+    activity_level: activityLevel,
+    claims_count: claimsCount,
+    time_gap_between_claims: timeGapBetweenClaims,
+  }
+  try {
+    const prediction = await requestFraudPrediction(fraudInput)
+    const locationMismatch = Number(locationMatch) === 0
+    const shouldBlock =
+      locationMismatch ||
+      prediction.fraud === 1 ||
+      Number(prediction.fraudScore || 0) >= FRAUD_BLOCK_SCORE_THRESHOLD
+    return {
+      ok: true,
+      shouldBlock,
+      fraud: prediction.fraud,
+      fraudScore: Number(prediction.fraudScore.toFixed(4)),
+      modelInput: fraudInput,
+      modelOutput: prediction.raw,
+      reason: locationMismatch ? 'location_mismatch' : 'model_decision',
+      location: locationInfo,
+      enteredCity,
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      shouldBlock: true,
+      fraud: 0,
+      fraudScore: 0,
+      modelInput: fraudInput,
+      modelOutput: null,
+      error: error?.message || 'Fraud model unavailable',
+      location: locationInfo,
+      enteredCity,
+    }
+  }
+}
+
 const CLAIM_TIER_MULTIPLIER = { basic: 0.7, standard: 0.8, premium: 0.9 }
 const CLAIM_TRIGGER_PRIORITY = ['severe_aqi', 'extreme_heat', 'heavy_rain', 'severe_wind']
 
@@ -946,7 +1312,7 @@ function buildSyntheticExtremeWeather(triggerCode) {
 async function applyAutoClaimFromWeather(
   user,
   weather,
-  { degraded = false, bypassDailyLimit = false, simulation = false } = {}
+  { degraded = false, bypassDailyLimit = false, simulation = false, fraudContext = null } = {}
 ) {
   if (degraded || !weather) return null
 
@@ -984,6 +1350,62 @@ async function applyAutoClaimFromWeather(
   const payoutAmount = Math.min(perClaim, remainingCoverage)
   if (payoutAmount <= 0) return null
 
+  const fraudCheck = await evaluateClaimFraudRisk(user, weather, {
+    currentLocation: fraudContext?.currentLocation,
+    activityLevel: fraudContext?.activityLevel,
+    enteredLocation: fraudContext?.enteredLocation,
+  })
+  const manualReviewApproved = Boolean(simulation && fraudContext?.manualReviewApprove)
+  const forceFraudBlock = Boolean(simulation && fraudContext?.forceFraudBlock)
+  const blockedByFraud = forceFraudBlock || (!manualReviewApproved && (!fraudCheck.ok || fraudCheck.shouldBlock))
+  if (blockedByFraud) {
+    const blockedClaimRecord = {
+      id: randomUUID(),
+      trigger: 'fraud_block',
+      triggerLabel: simulation
+        ? '[TEST] Fraud risk detected'
+        : !fraudCheck.ok
+          ? 'Fraud check unavailable'
+          : 'Fraud risk detected',
+      amount: 0,
+      coverageRemainingAfter: remainingCoverage,
+      status: 'cancelled_fraud',
+      razorpayPayoutId: '',
+      payoutMode: 'blocked',
+      subscriptionOrderId: periodOrderId,
+      createdAt: new Date().toISOString(),
+      fraud: {
+        fraud: fraudCheck.fraud,
+        score: fraudCheck.fraudScore,
+        input: fraudCheck.modelInput,
+      },
+    }
+    claims.push(blockedClaimRecord)
+    profile.claims = claims.slice(-100)
+    profile.updatedAt = new Date().toISOString()
+    user.profile = normalizeProfileForSave({ ...profile })
+    user.markModified('profile')
+    return {
+      ok: false,
+      blockedByFraud: true,
+      headline: !fraudCheck.ok ? 'Fraud check unavailable' : 'Fraud detected',
+      message: !fraudCheck.ok
+        ? `Claim cancelled because fraud check failed (${fraudCheck.error || 'service unavailable'}).`
+        : fraudCheck.reason === 'location_mismatch'
+          ? 'Claim cancelled because current location does not match profile city.'
+          : `Claim cancelled by fraud engine (score: ${fraudCheck.fraudScore.toFixed(2)}).`,
+      fraud: fraudCheck,
+      claim: blockedClaimRecord,
+      decisionSummary: {
+        threshold: FRAUD_BLOCK_SCORE_THRESHOLD,
+        score: fraudCheck.fraudScore,
+        locationMatch: fraudCheck.modelInput?.location_match,
+        modelFraud: fraudCheck.fraud,
+        source: fraudCheck.reason || 'model_decision',
+      },
+    }
+  }
+
   const primary = triggers[0]
   const payout = await processSimulatedRazorpayPayout()
   if (!payout.ok) {
@@ -1009,6 +1431,13 @@ async function applyAutoClaimFromWeather(
     payoutMode: payout.mode,
     subscriptionOrderId: periodOrderId,
     createdAt: new Date().toISOString(),
+    fraud: {
+      fraud: fraudCheck.fraud,
+      score: fraudCheck.fraudScore,
+      reason: fraudCheck.reason,
+      input: fraudCheck.modelInput,
+      manualReviewApproved,
+    },
   }
 
   claims.push(claimRecord)
@@ -1032,6 +1461,21 @@ async function applyAutoClaimFromWeather(
     payoutMode: payout.mode,
     remainingCoverage: coverageAfter,
     claim: claimRecord,
+    fraud: {
+      fraud: fraudCheck.fraud,
+      fraudScore: fraudCheck.fraudScore,
+      reason: fraudCheck.reason,
+      modelInput: fraudCheck.modelInput,
+      manualReviewApproved,
+    },
+    decisionSummary: {
+      threshold: FRAUD_BLOCK_SCORE_THRESHOLD,
+      score: fraudCheck.fraudScore,
+      locationMatch: fraudCheck.modelInput?.location_match,
+      modelFraud: fraudCheck.fraud,
+      source: manualReviewApproved ? 'manual_review_override' : fraudCheck.reason || 'model_decision',
+      manualReviewApproved,
+    },
   }
 }
 
@@ -1101,44 +1545,37 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'paynest-api' })
 })
 
-/** City name search via API Ninjas (https://api-ninjas.com/api/city). Uses API_NINJAS_KEY. */
+/** City name search via OpenStreetMap Nominatim (same map data ecosystem as Leaflet/OSM UI). */
 app.get('/api/locations/city-search', async (req, res) => {
   try {
-    const key = String(API_NINJAS_KEY || '').trim()
-    if (!key) {
-      return res.status(503).json({
-        message: 'City search is not configured. Set API_NINJAS_KEY in the server environment.',
-      })
-    }
-
     const name = String(req.query.name || req.query.q || '').trim()
     if (name.length < 2) {
       return res.status(400).json({ message: 'Query must be at least 2 characters.' })
     }
 
-    const url = new URL('https://api.api-ninjas.com/v1/city')
-    url.searchParams.set('name', name)
-    // Do not send `limit` — free tier rejects it ("premium subscribers only"). Default is one city per name.
+    const url = new URL('https://nominatim.openstreetmap.org/search')
+    url.searchParams.set('format', 'jsonv2')
+    url.searchParams.set('q', name)
+    url.searchParams.set('limit', '8')
+    url.searchParams.set('addressdetails', '1')
+    url.searchParams.set('accept-language', 'en')
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 12_000)
     const response = await fetch(url.toString(), {
-      headers: { 'X-Api-Key': key, Accept: 'application/json' },
+      headers: {
+        'User-Agent': NOMINATIM_USER_AGENT,
+        Accept: 'application/json',
+        'Accept-Language': 'en',
+      },
       signal: controller.signal,
     })
     clearTimeout(timeout)
 
     if (!response.ok) {
       const text = await response.text()
-      let apiMessage = text.slice(0, 300)
-      try {
-        const errBody = JSON.parse(text)
-        if (typeof errBody.error === 'string') apiMessage = errBody.error
-      } catch {
-        /* keep raw slice */
-      }
       return res.status(502).json({
-        message: apiMessage || 'City lookup service request failed.',
+        message: text.slice(0, 300) || 'City lookup service request failed.',
       })
     }
 
@@ -1147,32 +1584,38 @@ app.get('/api/locations/city-search', async (req, res) => {
       return res.json({ results: [] })
     }
 
-    const results = data.map((row, i) => {
-      const cityName = String(row.name || '').trim()
-      const country = String(row.country || '').trim().toUpperCase()
-      const lat = row.latitude
-      const lon = row.longitude
-      const pop =
-        row.population != null && Number.isFinite(Number(row.population))
-          ? Number(row.population)
-          : null
-      const capital = row.is_capital === true
-      const displayName = [cityName, country].filter(Boolean).join(', ')
-      const subtitle = [capital ? 'Capital' : null, pop != null ? `pop. ${pop.toLocaleString('en-IN')}` : null]
-        .filter(Boolean)
-        .join(' · ')
-      const label = subtitle ? `${displayName} (${subtitle})` : displayName
-      const city = [cityName, country].filter(Boolean).join(', ')
+    const results = data
+      .map((row, i) => {
+        const lat = Number(row?.lat)
+        const lon = Number(row?.lon)
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+        const addr = row?.address || {}
+        const cityName = String(
+          addr.city ||
+            addr.town ||
+            addr.village ||
+            addr.municipality ||
+            addr.county ||
+            String(row?.display_name || '').split(',')[0] ||
+            ''
+        ).trim()
+        const state = String(addr.state || addr.state_district || '').trim()
+        const country = String(addr.country || '').trim()
+        const countryCode = String(addr.country_code || '').trim().toUpperCase()
 
-      return {
-        placeId: `${cityName}|${country}|${lat}|${lon}|${i}`,
-        lat,
-        lon,
-        displayName: subtitle ? `${displayName} — ${subtitle}` : displayName,
-        label,
-        city,
-      }
-    })
+        const displayName = [cityName, state, country].filter(Boolean).join(', ')
+        const city = [cityName, countryCode].filter(Boolean).join(', ')
+
+        return {
+          placeId: `${row?.osm_type || 'osm'}|${row?.osm_id || i}|${lat}|${lon}|${i}`,
+          lat,
+          lon,
+          displayName: displayName || String(row?.display_name || '').trim(),
+          label: displayName || String(row?.display_name || '').trim(),
+          city: city || cityName,
+        }
+      })
+      .filter(Boolean)
 
     return res.json({ results })
   } catch (error) {
@@ -1213,6 +1656,20 @@ app.post('/api/auth/signup', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const { identity = '', password = '' } = req.body || {}
   const lookup = identity.trim().toLowerCase()
+  if (safeEqualText(lookup, ADMIN_EMAIL) && safeEqualText(String(password || ''), ADMIN_PASSWORD)) {
+    const token = randomUUID()
+    await Session.create({ token, role: 'admin', adminEmail: ADMIN_EMAIL })
+    return res.json({
+      token,
+      user: {
+        id: 'admin',
+        name: ADMIN_DISPLAY_NAME,
+        email: ADMIN_EMAIL,
+        role: 'admin',
+      },
+    })
+  }
+
   const user = await User.findOne({
     $or: [{ email: lookup }, { name: lookup }],
   })
@@ -1230,6 +1687,190 @@ app.post('/api/auth/login', async (req, res) => {
   await Session.create({ token, userId: user._id })
 
   return res.json({ token, user: sanitizeUser(user) })
+})
+
+app.post('/api/admin/login', async (req, res) => {
+  const { email = '', password = '' } = req.body || {}
+  const normalizedEmail = String(email).trim().toLowerCase()
+  const normalizedPassword = String(password || '')
+
+  if (!normalizedEmail || !normalizedPassword) {
+    return res.status(400).json({ message: 'Email and password are required.' })
+  }
+  if (!safeEqualText(normalizedEmail, ADMIN_EMAIL) || !safeEqualText(normalizedPassword, ADMIN_PASSWORD)) {
+    return res.status(401).json({ message: 'Invalid admin credentials.' })
+  }
+
+  const token = randomUUID()
+  await Session.create({ token, role: 'admin', adminEmail: ADMIN_EMAIL })
+  return res.json({
+    token,
+    admin: {
+      email: ADMIN_EMAIL,
+      name: ADMIN_DISPLAY_NAME,
+      role: 'admin',
+    },
+  })
+})
+
+app.get('/api/admin/me', async (req, res) => {
+  const session = await getAdminSessionFromToken(req)
+  if (!session) return res.status(401).json({ message: 'Admin authentication required.' })
+  return res.json({
+    admin: {
+      email: session.adminEmail || ADMIN_EMAIL,
+      name: ADMIN_DISPLAY_NAME,
+      role: 'admin',
+    },
+  })
+})
+
+app.get('/api/admin/users', async (req, res) => {
+  const adminSession = await requireAdminSession(req, res)
+  if (!adminSession) return
+
+  const users = await User.find({}).sort({ createdAt: -1 }).limit(500)
+  const summaries = users.map(buildAdminUserSummary)
+  const totals = summaries.reduce(
+    (acc, u) => {
+      acc.users += 1
+      if (u.profileCompleted) acc.profileCompleted += 1
+      if (u.subscription?.status === 'active') acc.activeSubscriptions += 1
+      acc.totalClaims += Number(u.claimsCount || 0)
+      acc.totalPayments += Number(u.paymentsCount || 0)
+      return acc
+    },
+    { users: 0, profileCompleted: 0, activeSubscriptions: 0, totalClaims: 0, totalPayments: 0 }
+  )
+
+  return res.json({ totals, users: summaries })
+})
+
+app.get('/api/admin/users/:userId', async (req, res) => {
+  const adminSession = await requireAdminSession(req, res)
+  if (!adminSession) return
+
+  const { userId } = req.params
+  if (!mongoose.isValidObjectId(userId)) {
+    return res.status(400).json({ message: 'Invalid user id.' })
+  }
+
+  const user = await User.findById(userId)
+  if (!user) return res.status(404).json({ message: 'User not found.' })
+
+  const summary = buildAdminUserSummary(user)
+  const profile = cloneProfilePlain(user)
+  const claims = [...(Array.isArray(profile.claims) ? profile.claims : [])].sort(
+    (a, b) => new Date(b?.createdAt || 0) - new Date(a?.createdAt || 0)
+  )
+  const payments = [...(Array.isArray(profile.payments) ? profile.payments : [])].sort(
+    (a, b) => new Date(b?.paidAt || 0) - new Date(a?.paidAt || 0)
+  )
+
+  return res.json({
+    user: {
+      ...summary,
+      profile: {
+        fullName: profile.fullName || '',
+        phone: profile.phone || '',
+        city: profile.city || '',
+        workPlatform: profile.workPlatform || '',
+        dailyIncome: Number(profile.dailyIncome || 0),
+        selectedPlan: profile.selectedPlan || null,
+        dynamicPricing: profile.dynamicPricing || null,
+        rewards: profile.rewards || null,
+      },
+      disruptions: Array.isArray(profile.disruptions) ? profile.disruptions : [],
+      claims,
+      payments,
+    },
+  })
+})
+
+app.patch('/api/admin/users/:userId', async (req, res) => {
+  const adminSession = await requireAdminSession(req, res)
+  if (!adminSession) return
+
+  const { userId } = req.params
+  if (!mongoose.isValidObjectId(userId)) {
+    return res.status(400).json({ message: 'Invalid user id.' })
+  }
+  const user = await User.findById(userId)
+  if (!user) return res.status(404).json({ message: 'User not found.' })
+
+  const {
+    name,
+    email,
+    profileCompleted,
+    needsInitialPlanChoice,
+    city,
+    workPlatform,
+    dailyIncome,
+    phone,
+    subscriptionStatus,
+  } = req.body || {}
+
+  if (typeof name === 'string' && name.trim()) user.name = name.trim()
+  if (typeof email === 'string' && email.trim()) {
+    const normalizedEmail = email.trim().toLowerCase()
+    const existing = await User.findOne({ email: normalizedEmail, _id: { $ne: user._id } })
+    if (existing) return res.status(409).json({ message: 'Email already used by another account.' })
+    user.email = normalizedEmail
+  }
+  if (typeof profileCompleted === 'boolean') user.profileCompleted = profileCompleted
+  if (typeof needsInitialPlanChoice === 'boolean') user.needsInitialPlanChoice = needsInitialPlanChoice
+
+  const profile = cloneProfilePlain(user)
+  if (typeof city === 'string') profile.city = city.trim()
+  if (typeof workPlatform === 'string') profile.workPlatform = workPlatform.trim()
+  if (typeof phone === 'string') profile.phone = phone.trim()
+  if (dailyIncome !== undefined && Number.isFinite(Number(dailyIncome))) {
+    profile.dailyIncome = Math.max(0, Number(dailyIncome))
+  }
+  if (typeof subscriptionStatus === 'string') {
+    const nextStatus = subscriptionStatus.trim().toLowerCase()
+    if (['none', 'active', 'expired'].includes(nextStatus)) {
+      const snap = getSubscriptionSnapshot(profile.subscription)
+      profile.subscription = {
+        ...snap,
+        status: nextStatus,
+        daysLeft: nextStatus === 'active' ? Math.max(1, Number(snap.daysLeft || 1)) : 0,
+        expiresAt:
+          nextStatus === 'active'
+            ? snap.expiresAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+            : '',
+      }
+    }
+  }
+
+  profile.updatedAt = new Date().toISOString()
+  user.profile = normalizeProfileForSave(profile)
+  user.markModified('profile')
+  await user.save()
+
+  return res.json({ ok: true, user: buildAdminUserSummary(user) })
+})
+
+app.post('/api/admin/users/:userId/claims/reset', async (req, res) => {
+  const adminSession = await requireAdminSession(req, res)
+  if (!adminSession) return
+
+  const { userId } = req.params
+  if (!mongoose.isValidObjectId(userId)) {
+    return res.status(400).json({ message: 'Invalid user id.' })
+  }
+  const user = await User.findById(userId)
+  if (!user) return res.status(404).json({ message: 'User not found.' })
+
+  const profile = cloneProfilePlain(user)
+  profile.claims = []
+  profile.lastAutoClaimDayUtc = ''
+  profile.updatedAt = new Date().toISOString()
+  user.profile = normalizeProfileForSave(profile)
+  user.markModified('profile')
+  await user.save()
+
+  return res.json({ ok: true })
 })
 
 app.get('/api/auth/me', async (req, res) => {
@@ -1285,7 +1926,8 @@ function cloneProfilePlain(user) {
   const raw = user.profile
   if (!raw) return {}
   try {
-    return JSON.parse(JSON.stringify(raw))
+    const parsed = JSON.parse(JSON.stringify(raw))
+    return parsed && typeof parsed === 'object' ? parsed : {}
   } catch {
     return { ...(typeof raw === 'object' ? raw : {}) }
   }
@@ -1334,6 +1976,100 @@ function getSubscriptionSnapshot(subscription) {
     daysLeft,
     expiresAt: subscription.expiresAt,
     startedAt: subscription.startedAt || null,
+  }
+}
+
+function roundMoney(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return 0
+  return Number((Math.round(v * 100) / 100).toFixed(2))
+}
+
+function getNoClaimRewardSnapshot(profileInput, { nowMs = Date.now() } = {}) {
+  const profile = profileInput || {}
+  const rewards = profile.rewards || {}
+  const usedSourceOrderId = String(rewards.lastDiscountSourceOrderId || '')
+
+  const paymentsRaw = Array.isArray(profile.payments) ? profile.payments : []
+  const claimsRaw = Array.isArray(profile.claims) ? profile.claims : []
+
+  const claimCountByOrder = new Map()
+  for (const claim of claimsRaw) {
+    if (String(claim?.status || '') !== 'credited') continue
+    const orderId = String(claim?.subscriptionOrderId || '')
+    if (!orderId) continue
+    claimCountByOrder.set(orderId, (claimCountByOrder.get(orderId) || 0) + 1)
+  }
+
+  const cyclesAsc = [...paymentsRaw]
+    .sort((a, b) => new Date(a?.paidAt || 0).getTime() - new Date(b?.paidAt || 0).getTime())
+    .map((payment) => {
+      const paidAt = String(payment?.paidAt || '')
+      const paidMs = new Date(paidAt).getTime()
+      const orderId = String(payment?.razorpayOrderId || '')
+      const endsAtMs = Number.isFinite(paidMs) ? paidMs + 7 * 24 * 60 * 60 * 1000 : NaN
+      const ended = Number.isFinite(endsAtMs) ? nowMs >= endsAtMs : false
+      const claimCount = orderId ? Number(claimCountByOrder.get(orderId) || 0) : 0
+      const claimFree = claimCount === 0
+      return {
+        orderId,
+        paidAt,
+        endsAt: Number.isFinite(endsAtMs) ? new Date(endsAtMs).toISOString() : '',
+        ended,
+        claimCount,
+        claimFree,
+      }
+    })
+
+  let currentStreak = 0
+  for (let i = cyclesAsc.length - 1; i >= 0; i -= 1) {
+    const cycle = cyclesAsc[i]
+    if (!cycle.ended) continue
+    if (!cycle.claimFree) break
+    currentStreak += 1
+  }
+
+  const latestEndedCycle = [...cyclesAsc].reverse().find((cycle) => cycle.ended) || null
+  const eligible =
+    Boolean(latestEndedCycle?.orderId) &&
+    latestEndedCycle.claimFree &&
+    latestEndedCycle.orderId !== usedSourceOrderId
+
+  const selectedWeeklyPremium = Number(profile?.selectedPlan?.weeklyPremium || 0)
+  const discountPercent = eligible ? NO_CLAIM_RENEWAL_DISCOUNT_PERCENT : 0
+  const discountAmountPreview =
+    selectedWeeklyPremium > 0
+      ? roundMoney((selectedWeeklyPremium * discountPercent) / 100)
+      : 0
+
+  const recentCycles = [...cyclesAsc]
+    .reverse()
+    .slice(0, 6)
+    .map((cycle) => ({
+      orderId: cycle.orderId,
+      paidAt: cycle.paidAt,
+      endsAt: cycle.endsAt,
+      claimCount: cycle.claimCount,
+      claimFree: cycle.claimFree,
+      ended: cycle.ended,
+      status: cycle.ended ? (cycle.claimFree ? 'claim-free' : 'claimed') : 'active',
+    }))
+
+  return {
+    discountPercent: NO_CLAIM_RENEWAL_DISCOUNT_PERCENT,
+    eligible,
+    eligibleSourceOrderId: eligible ? latestEndedCycle.orderId : '',
+    nextDiscountAmountPreview: discountAmountPreview,
+    claimFreeCycles: cyclesAsc.filter((c) => c.ended && c.claimFree).length,
+    claimedCycles: cyclesAsc.filter((c) => c.ended && !c.claimFree).length,
+    currentStreak,
+    latestCycleStatus: latestEndedCycle
+      ? latestEndedCycle.claimFree
+        ? 'claim-free'
+        : 'claimed'
+      : 'none',
+    totalDiscountUsed: roundMoney(rewards.totalDiscountUsed || 0),
+    recentCycles,
   }
 }
 
@@ -1425,11 +2161,8 @@ app.get('/api/claims/summary', async (req, res) => {
   return res.json(buildClaimsSummary(profile))
 })
 
-/** Local / QA only: set PAYNEST_CLAIM_SIMULATOR=true. Fakes extreme weather and runs the same payout logic. */
+/** Testing helper: run claim flow with synthetic trigger + fraud check. */
 app.post('/api/claims/simulate', async (req, res) => {
-  if (!CLAIM_SIMULATOR_ENABLED) {
-    return res.status(404).json({ message: 'Not found.' })
-  }
   const user = await getUserFromToken(req)
   if (!user) return res.status(401).json({ message: 'Unauthorized' })
 
@@ -1441,25 +2174,30 @@ app.post('/api/claims/simulate', async (req, res) => {
     })
   }
 
+  const profileBefore = cloneProfilePlain(user)
+  const enteredCity = String(profileBefore?.city || '').trim()
   const synthetic = buildSyntheticExtremeWeather(trigger)
+  const currentLocation = {
+    latitude: toFiniteNumber(req.body?.currentLocation?.latitude),
+    longitude: toFiniteNumber(req.body?.currentLocation?.longitude),
+  }
+
   const result = await applyAutoClaimFromWeather(user, synthetic, {
     degraded: false,
     bypassDailyLimit: true,
     simulation: true,
+    fraudContext: {
+      currentLocation,
+      enteredLocation: String(req.body?.enteredLocation || enteredCity),
+      manualReviewApprove: Boolean(req.body?.manualReviewApprove),
+      forceFraudBlock: Boolean(req.body?.forceFraudBlock),
+    },
   })
 
   if (!result) {
     return res.status(400).json({
       message:
-        'No claim created. Requires active subscription (after Razorpay payment), selected plan, daily income, and remaining coverage.',
-    })
-  }
-
-  if (!result.ok) {
-    return res.status(400).json({
-      message: result.message || 'Claim simulation failed.',
-      headline: result.headline,
-      triggerLabel: result.triggerLabel,
+        'No claim created. Requires active subscription (after payment), selected plan, daily income, and remaining coverage.',
     })
   }
 
@@ -1470,11 +2208,8 @@ app.post('/api/claims/simulate', async (req, res) => {
   })
 })
 
-/** Local / QA only: clears claim history + daily auto-claim lock so coverage resets for testing. */
+/** Testing helper: clear claim history + daily lock. */
 app.post('/api/claims/reset', async (req, res) => {
-  if (!CLAIM_SIMULATOR_ENABLED) {
-    return res.status(404).json({ message: 'Not found.' })
-  }
   const user = await getUserFromToken(req)
   if (!user) return res.status(401).json({ message: 'Unauthorized' })
 
@@ -1486,11 +2221,10 @@ app.post('/api/claims/reset', async (req, res) => {
   user.markModified('profile')
   await user.save()
 
-  const nextProfile = cloneProfilePlain(user)
   return res.json({
     ok: true,
     user: sanitizeUser(user),
-    summary: buildClaimsSummary(nextProfile),
+    summary: buildClaimsSummary(cloneProfilePlain(user)),
   })
 })
 
@@ -1504,6 +2238,13 @@ app.get('/api/weather/current', async (req, res) => {
       return res.status(400).json({ message: 'User city is missing. Please complete profile first.' })
     }
 
+    const reqLat = Number(req.query?.lat)
+    const reqLon = Number(req.query?.lon)
+    const currentLocation =
+      Number.isFinite(reqLat) && Number.isFinite(reqLon)
+        ? { latitude: reqLat, longitude: reqLon }
+        : null
+
     const cachedWeather = user?.profile?.weather || null
     const cachedAtMs = cachedWeather?.fetchedAt ? new Date(cachedWeather.fetchedAt).getTime() : NaN
     const isFreshCache =
@@ -1513,8 +2254,11 @@ app.get('/api/weather/current', async (req, res) => {
       Date.now() - cachedAtMs >= 0 &&
       Date.now() - cachedAtMs < WEATHER_CACHE_TTL_MS
     if (isFreshCache) {
-      const autoPayout = await applyAutoClaimFromWeather(user, cachedWeather, { degraded: false })
-      if (autoPayout?.ok) await user.save()
+      const autoPayout = await applyAutoClaimFromWeather(user, cachedWeather, {
+        degraded: false,
+        fraudContext: { currentLocation },
+      })
+      if (autoPayout?.claim) await user.save()
       return res.json({ weather: cachedWeather, user: sanitizeUser(user), cached: true, autoPayout })
     }
 
@@ -1525,7 +2269,10 @@ app.get('/api/weather/current', async (req, res) => {
       profile.updatedAt = new Date().toISOString()
       user.profile = normalizeProfileForSave(profile)
       user.markModified('profile')
-      const autoPayout = await applyAutoClaimFromWeather(user, weather, { degraded: false })
+      const autoPayout = await applyAutoClaimFromWeather(user, weather, {
+        degraded: false,
+        fraudContext: { currentLocation },
+      })
       await user.save()
       return res.json({ weather, user: sanitizeUser(user), autoPayout })
     } catch {
@@ -1848,6 +2595,11 @@ app.post('/api/payments/create-order', async (req, res) => {
     return res.status(400).json({ message: 'Invalid plan premium for payment.' })
   }
 
+  const rewardSnapshot = getNoClaimRewardSnapshot(profile)
+  const discountPercent = rewardSnapshot.eligible ? NO_CLAIM_RENEWAL_DISCOUNT_PERCENT : 0
+  const discountAmount = roundMoney((weeklyPremium * discountPercent) / 100)
+  const payablePremium = roundMoney(Math.max(1, weeklyPremium - discountAmount))
+
   const rzp = getRazorpayClient()
   if (!rzp) {
     return res.status(503).json({
@@ -1856,7 +2608,7 @@ app.post('/api/payments/create-order', async (req, res) => {
     })
   }
 
-  const amountPaise = Math.round(weeklyPremium * 100)
+  const amountPaise = Math.round(payablePremium * 100)
   const receipt = `paynest_${String(user._id).slice(-6)}_${Date.now()}`
 
   const order = await rzp.orders.create({
@@ -1867,8 +2619,27 @@ app.post('/api/payments/create-order', async (req, res) => {
       userId: String(user._id),
       tier: String(selectedPlan.tier || ''),
       weeklyPremium: String(weeklyPremium),
+      discountAmount: String(discountAmount),
+      discountPercent: String(discountPercent),
+      rewardSourceOrderId: rewardSnapshot.eligibleSourceOrderId || '',
     },
   })
+
+  const paymentIntents = Array.isArray(profile.paymentIntents) ? profile.paymentIntents : []
+  paymentIntents.push({
+    razorpayOrderId: order.id,
+    basePremium: weeklyPremium,
+    finalPremium: payablePremium,
+    discountAmount,
+    discountPercent,
+    rewardSourceOrderId: rewardSnapshot.eligibleSourceOrderId || '',
+    createdAt: new Date().toISOString(),
+  })
+  profile.paymentIntents = paymentIntents.slice(-100)
+  profile.updatedAt = new Date().toISOString()
+  user.profile = normalizeProfileForSave(profile)
+  user.markModified('profile')
+  await user.save()
 
   return res.json({
     keyId: RAZORPAY_KEY_ID,
@@ -1879,6 +2650,14 @@ app.post('/api/payments/create-order', async (req, res) => {
       receipt: order.receipt,
     },
     selectedPlan,
+    paymentSummary: {
+      basePremium: weeklyPremium,
+      discountAmount,
+      discountPercent,
+      payablePremium,
+      rewardApplied: discountAmount > 0,
+    },
+    rewards: rewardSnapshot,
     user: {
       name: user.name,
       email: user.email,
@@ -1920,7 +2699,16 @@ app.post('/api/payments/verify', async (req, res) => {
 
   const profile = cloneProfilePlain(user)
   const selectedPlan = profile.selectedPlan || null
-  const weeklyPremium = Number(selectedPlan?.weeklyPremium || 0)
+  const paymentIntents = Array.isArray(profile.paymentIntents) ? profile.paymentIntents : []
+  const intentIdx = paymentIntents.findIndex(
+    (it) => String(it?.razorpayOrderId || '') === String(razorpayOrderId)
+  )
+  const intent = intentIdx >= 0 ? paymentIntents[intentIdx] : null
+  const basePremium = Number(intent?.basePremium ?? selectedPlan?.weeklyPremium ?? 0)
+  const finalPremium = Number(intent?.finalPremium ?? selectedPlan?.weeklyPremium ?? 0)
+  const discountAmount = roundMoney(intent?.discountAmount || 0)
+  const discountPercent = Number(intent?.discountPercent || 0)
+  const rewardSourceOrderId = String(intent?.rewardSourceOrderId || '')
   const now = new Date()
   const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
 
@@ -1929,13 +2717,29 @@ app.post('/api/payments/verify', async (req, res) => {
     razorpayOrderId,
     razorpayPaymentId,
     razorpaySignature,
-    amount: weeklyPremium,
+    basePremium,
+    discountAmount,
+    discountPercent,
+    rewardSourceOrderId,
+    amount: finalPremium,
     currency: 'INR',
     status: 'captured',
     tier: String(selectedPlan?.tier || ''),
-    weeklyPremium,
+    weeklyPremium: finalPremium,
     paidAt: now.toISOString(),
   })
+
+  if (intentIdx >= 0) {
+    paymentIntents.splice(intentIdx, 1)
+  }
+  profile.paymentIntents = paymentIntents.slice(-100)
+
+  const rewards = profile.rewards && typeof profile.rewards === 'object' ? profile.rewards : {}
+  if (discountAmount > 0 && rewardSourceOrderId) {
+    rewards.lastDiscountSourceOrderId = rewardSourceOrderId
+    rewards.totalDiscountUsed = roundMoney(Number(rewards.totalDiscountUsed || 0) + discountAmount)
+  }
+  profile.rewards = rewards
 
   profile.payments = payments.slice(-100)
   profile.subscription = {
@@ -1945,7 +2749,7 @@ app.post('/api/payments/verify', async (req, res) => {
     daysLeft: 7,
     lastPaymentId: razorpayPaymentId,
     lastOrderId: razorpayOrderId,
-    amountPaid: weeklyPremium,
+    amountPaid: finalPremium,
   }
   profile.updatedAt = now.toISOString()
 
@@ -1971,6 +2775,9 @@ app.get('/api/payments/statements', async (req, res) => {
     .map((payment) => ({
       paymentId: payment?.razorpayPaymentId || '',
       orderId: payment?.razorpayOrderId || '',
+      basePremium: Number(payment?.basePremium || payment?.weeklyPremium || payment?.amount || 0),
+      discountAmount: Number(payment?.discountAmount || 0),
+      discountPercent: Number(payment?.discountPercent || 0),
       amount: Number(payment?.amount || 0),
       currency: payment?.currency || 'INR',
       status: payment?.status || 'captured',
@@ -1993,6 +2800,18 @@ app.get('/api/payments/statements', async (req, res) => {
   })
 })
 
+app.get('/api/rewards/status', async (req, res) => {
+  const user = await getUserFromToken(req)
+  if (!user) return res.status(401).json({ message: 'Unauthorized' })
+  const profile = cloneProfilePlain(user)
+  const rewards = getNoClaimRewardSnapshot(profile)
+  return res.json({
+    rewards,
+    selectedPlan: profile.selectedPlan || null,
+    subscription: getSubscriptionSnapshot(profile.subscription),
+  })
+})
+
 app.post('/api/auth/logout', async (req, res) => {
   const token = getSessionToken(req)
   if (token) await Session.deleteOne({ token })
@@ -2008,11 +2827,9 @@ async function startServer() {
     } else {
       console.log('CORS: reflecting request Origin (set FRONTEND_ORIGINS for an explicit allowlist)')
     }
-    if (CLAIM_SIMULATOR_ENABLED) {
-      console.log(
-        'Claim simulator: POST /api/claims/simulate and POST /api/claims/reset enabled (PAYNEST_CLAIM_SIMULATOR).'
-      )
-    }
+    console.log(
+      `Fraud model: ${FRAUD_MODEL_PREDICT_URL} (score threshold >= ${FRAUD_BLOCK_SCORE_THRESHOLD.toFixed(2)})`
+    )
     const tr = getClaimTriggerThresholds()
     console.log(
       `Auto-claim thresholds: rain>${tr.rainMm}mm AQI>${tr.aqi} temp>${tr.tempC}°C wind>=${tr.windKmh}km/h` +

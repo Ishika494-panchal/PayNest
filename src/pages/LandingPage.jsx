@@ -15,7 +15,7 @@ function LandingPage({ isLoggedIn, userName, onLogout }) {
       <FeaturesGrid />
       <MissionSection />
       <Testimonial />
-      <Footer />
+      <Footer variant="landing" />
     </div>
   )
 }

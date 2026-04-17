@@ -1,14 +1,17 @@
 import { ArrowRight, BadgeCheck, Shield } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { createPaymentOrder, getCurrentPricing, getSubscriptionStatus, verifyPayment } from '../lib/api'
 
 function CheckoutPage({ token, user }) {
+  const navigate = useNavigate()
   const [selectedPlan, setSelectedPlan] = useState(user?.profile?.selectedPlan || null)
   const [pricing, setPricing] = useState(user?.profile?.dynamicPricing || null)
   const [subscription, setSubscription] = useState(null)
   const [loading, setLoading] = useState(false)
   const [paying, setPaying] = useState(false)
   const [error, setError] = useState('')
+  const [orderPreview, setOrderPreview] = useState(null)
 
   useEffect(() => {
     let mounted = true
@@ -46,9 +49,9 @@ function CheckoutPage({ token, user }) {
   )
 
   const activePlan = selectedPlan || fallbackPlan
-  const basePremium = Number(activePlan.weeklyPremium || 0)
-  const discount = 0
-  const total = Number((basePremium - discount).toFixed(2))
+  const basePremium = Number(orderPreview?.basePremium ?? activePlan.weeklyPremium ?? 0)
+  const discount = Number(orderPreview?.discountAmount || 0)
+  const total = Number(orderPreview?.payablePremium ?? (basePremium - discount).toFixed(2))
   const hasActiveSubscription = subscription?.status === 'active' && Number(subscription?.daysLeft || 0) > 0
 
   const loadRazorpayScript = async () => {
@@ -71,6 +74,7 @@ function CheckoutPage({ token, user }) {
       if (!loaded) throw new Error('Unable to load Razorpay checkout.')
 
       const orderResult = await createPaymentOrder(token)
+      setOrderPreview(orderResult.paymentSummary || null)
       const options = {
         key: orderResult.keyId,
         amount: orderResult.order.amount,
@@ -93,6 +97,7 @@ function CheckoutPage({ token, user }) {
               JSON.stringify(verify.subscription || null)
             )
             setPaying(false)
+            navigate('/dashboard', { replace: true })
           } catch (verifyError) {
             setError(verifyError.message || 'Payment verification failed.')
             setPaying(false)
@@ -160,6 +165,12 @@ function CheckoutPage({ token, user }) {
                 </div>
               </div>
             </div>
+
+            {orderPreview?.rewardApplied ? (
+              <p className="mt-4 rounded-xl border border-[#dfebdb] bg-[#f2faef] px-4 py-3 text-[13px] text-[#356748]">
+                No-claim reward applied: {Number(orderPreview.discountPercent || 0)}% off.
+              </p>
+            ) : null}
 
             {hasActiveSubscription ? (
               <p className="mt-5 rounded-xl border border-[#d3d9e4] bg-[#eef3fb] px-4 py-3 text-[13px] text-[#425069]">

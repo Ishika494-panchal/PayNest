@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { searchCities } from '../lib/api'
 
 /**
- * Real-time city search via backend → API Ninjas City API.
+ * Real-time city search via backend → OpenStreetMap/Nominatim.
  * `value` / `onChange` are the city string stored on the profile (geocodable text).
  */
 export default function CitySearchField({

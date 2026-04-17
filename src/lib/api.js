@@ -104,6 +104,40 @@ export async function getCurrentUser(token) {
   })
 }
 
+export async function getAdminMe(token) {
+  return request('/admin/me', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function getAdminUsers(token) {
+  return request('/admin/users', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function getAdminUserDetails(token, userId) {
+  return request(`/admin/users/${encodeURIComponent(userId)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function updateAdminUser(token, userId, payload) {
+  return request(`/admin/users/${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload || {}),
+  })
+}
+
+export async function resetAdminUserClaims(token, userId) {
+  return request(`/admin/users/${encodeURIComponent(userId)}/claims/reset`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({}),
+  })
+}
+
 export async function saveUserDetails(token, payload) {
   return request('/profile/details', {
     method: 'POST',
@@ -127,8 +161,12 @@ export async function completeInitialPlan(token) {
   })
 }
 
-export async function getCurrentWeather(token) {
-  return request('/weather/current', {
+export async function getCurrentWeather(token, currentLocation = null) {
+  const lat = Number(currentLocation?.latitude)
+  const lon = Number(currentLocation?.longitude)
+  const hasCoords = Number.isFinite(lat) && Number.isFinite(lon)
+  const query = hasCoords ? `?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}` : ''
+  return request(`/weather/current${query}`, {
     headers: { Authorization: `Bearer ${token}` },
   })
 }
@@ -139,7 +177,6 @@ export async function getClaimsSummary(token) {
   })
 }
 
-/** Only works when the server has PAYNEST_CLAIM_SIMULATOR=true (404 otherwise). */
 export async function simulateAutoClaim(token, payload = {}) {
   return request('/claims/simulate', {
     method: 'POST',
@@ -148,7 +185,6 @@ export async function simulateAutoClaim(token, payload = {}) {
   })
 }
 
-/** Clears claims + daily lock. Only when PAYNEST_CLAIM_SIMULATOR=true on server. */
 export async function resetClaimsForTesting(token) {
   return request('/claims/reset', {
     method: 'POST',
@@ -213,6 +249,12 @@ export async function getPaymentStatements(token) {
   })
 }
 
+export async function getRewardsStatus(token) {
+  return request('/rewards/status', {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
 export async function logout(token) {
   return request('/auth/logout', {
     method: 'POST',
@@ -220,7 +262,7 @@ export async function logout(token) {
   })
 }
 
-/** API Ninjas city search (min 2 chars). Proxied by backend; requires API_NINJAS_KEY on server. */
+/** OSM/Nominatim city search (min 2 chars), proxied by backend. */
 export async function searchCities(query) {
   const name = String(query || '').trim()
   if (name.length < 2) {

@@ -2,7 +2,46 @@ import { Check, CloudRain, ShieldAlert, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import DashboardSidebar from '../components/DashboardSidebar'
 import DashboardTopNav from '../components/DashboardTopNav'
-import { getClaimsSummary, getCurrentWeather, resetClaimsForTesting } from '../lib/api'
+import { getClaimsSummary, getCurrentWeather, resetClaimsForTesting, simulateAutoClaim } from '../lib/api'
+
+function readBrowserLocation() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) {
+      resolve(null)
+      return
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30_000 }
+    )
+  })
+}
+
+function buildBannerFromClaimRecord(claim) {
+  if (!claim) return null
+  const status = String(claim.status || '').toLowerCase()
+  if (status === 'cancelled_fraud') {
+    return {
+      id: claim.id || '',
+      headline: 'Fraud detected',
+      creditLine: 'Claim cancelled by fraud engine',
+      triggerLabel: claim.triggerLabel || 'Fraud risk detected',
+      payoutId: '',
+    }
+  }
+  if (status === 'credited') {
+    const amount = Number(claim.amount || 0)
+    return {
+      id: claim.id || '',
+      headline: 'Disruption detected ⚠️',
+      creditLine: `₹${amount} credited automatically`,
+      triggerLabel: claim.triggerLabel || 'Automatic claim credited',
+      payoutId: claim.razorpayPayoutId || '',
+    }
+  }
+  return null
+}
 
 function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
   const [summary, setSummary] = useState(null)
@@ -10,8 +49,9 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
   const [loadError, setLoadError] = useState('')
   const [liveWeatherSync, setLiveWeatherSync] = useState(false)
   const [summaryLoading, setSummaryLoading] = useState(true)
+  const [testBusy, setTestBusy] = useState(false)
+  const [testMsg, setTestMsg] = useState('')
   const [resetBusy, setResetBusy] = useState(false)
-  const [resetMsg, setResetMsg] = useState('')
 
   useEffect(() => {
     let mounted = true
@@ -25,6 +65,8 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
         const summaryResult = await getClaimsSummary(token)
         if (!mounted) return
         setSummary(summaryResult)
+        const latestClaim = Array.isArray(summaryResult?.claims) ? summaryResult.claims[0] : null
+        setAutoPayoutBanner(buildBannerFromClaimRecord(latestClaim))
         setLoadError('')
       } catch (err) {
         if (mounted) setLoadError(err?.message || 'Could not load claims.')
@@ -34,22 +76,22 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
 
       if (mounted) setSummaryLoading(false)
       setLiveWeatherSync(true)
-      getCurrentWeather(token)
+      const browserLocation = await readBrowserLocation()
+      getCurrentWeather(token, browserLocation)
         .then(async (weatherResult) => {
           if (!mounted) return
           if (weatherResult?.user && typeof onUserRefresh === 'function') {
             onUserRefresh(weatherResult.user)
           }
-          if (weatherResult?.autoPayout?.ok) {
-            setAutoPayoutBanner({
-              headline: weatherResult.autoPayout.headline,
-              creditLine: weatherResult.autoPayout.creditLine,
-              triggerLabel: weatherResult.autoPayout.triggerLabel,
-              payoutId: weatherResult.autoPayout.razorpayPayoutId,
-            })
+          if (weatherResult?.autoPayout?.claim) {
+            setAutoPayoutBanner(buildBannerFromClaimRecord(weatherResult.autoPayout.claim))
             try {
               const refreshed = await getClaimsSummary(token)
-              if (mounted) setSummary(refreshed)
+              if (mounted) {
+                setSummary(refreshed)
+                const latestClaim = Array.isArray(refreshed?.claims) ? refreshed.claims[0] : null
+                setAutoPayoutBanner(buildBannerFromClaimRecord(latestClaim))
+              }
             } catch {
               /* keep prior summary */
             }
@@ -68,38 +110,79 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
     }
   }, [token, onUserRefresh])
 
-  const planTitle = summary?.selectedPlan?.title || 'No plan selected'
-  const claims = Array.isArray(summary?.claims) ? summary.claims : []
-  const hasClaims = claims.length > 0
-  const ti = summary?.triggersInfo
+  const runTestAutoClaim = async ({ forceFraudBlock = false, manualReviewApprove = false } = {}) => {
+    if (!token || testBusy) return
+    setTestBusy(true)
+    setTestMsg('')
+    try {
+      const browserLocation = await readBrowserLocation()
+      const sim = await simulateAutoClaim(token, {
+        trigger: 'severe_aqi',
+        currentLocation: browserLocation || undefined,
+        enteredLocation: String(user?.profile?.city || ''),
+        forceFraudBlock,
+        manualReviewApprove,
+      }).catch(() => null)
+
+      if (sim?.user && typeof onUserRefresh === 'function') {
+        onUserRefresh(sim.user)
+      }
+      if (sim) {
+        const refreshed = await getClaimsSummary(token).catch(() => null)
+        if (refreshed) {
+          setSummary(refreshed)
+          const latestClaim = Array.isArray(refreshed?.claims) ? refreshed.claims[0] : null
+          setAutoPayoutBanner(buildBannerFromClaimRecord(latestClaim))
+        }
+        setTestMsg(
+          forceFraudBlock || sim.blockedByFraud
+            ? 'Fraud detected test ran: claim cancelled.'
+            : sim.ok
+              ? 'No-fraud test ran: claim credited.'
+              : 'Test claim ran.'
+        )
+      }
+    } catch (err) {
+      setTestMsg(err?.message || 'Auto test-claim failed.')
+    } finally {
+      setTestBusy(false)
+    }
+  }
 
   const runClaimReset = async () => {
     if (!token) return
     setResetBusy(true)
-    setResetMsg('')
     try {
       const r = await resetClaimsForTesting(token)
-      if (r?.user && typeof onUserRefresh === 'function') {
-        onUserRefresh(r.user)
+      if (r?.user && typeof onUserRefresh === 'function') onUserRefresh(r.user)
+      if (r?.summary) {
+        setSummary(r.summary)
+        const latestClaim = Array.isArray(r.summary?.claims) ? r.summary.claims[0] : null
+        setAutoPayoutBanner(buildBannerFromClaimRecord(latestClaim))
+      } else {
+        setAutoPayoutBanner(null)
       }
-      if (r?.summary) setSummary(r.summary)
-      setAutoPayoutBanner(null)
-      setResetMsg('Claim history cleared. Full plan coverage is available again for testing.')
+      setTestMsg('Claim history reset for testing.')
     } catch (err) {
-      setResetMsg(err?.message || 'Reset failed (enable PAYNEST_CLAIM_SIMULATOR on the server).')
+      setTestMsg(err?.message || 'Reset failed.')
     } finally {
       setResetBusy(false)
     }
   }
 
+  const planTitle = summary?.selectedPlan?.title || 'No plan selected'
+  const claims = Array.isArray(summary?.claims) ? summary.claims : []
+  const hasClaims = claims.length > 0
+  const ti = summary?.triggersInfo
+
   return (
-    <div className="min-h-screen bg-[#f5f3ee]">
+    <div className="min-h-screen overflow-x-hidden bg-[#f5f3ee]">
       <DashboardTopNav userName={userName} onLogout={onLogout} />
       <div className="flex min-h-[calc(100vh-72px)]">
         <DashboardSidebar onLogout={onLogout} />
 
-        <div className="flex flex-1 flex-col">
-          <main className="flex justify-center px-6 pb-12 pt-10 lg:px-8">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <main className="flex flex-col items-center px-4 pb-12 pt-6 sm:px-6 sm:pt-8 lg:px-8 lg:pt-10">
             <section className="w-full max-w-[640px] space-y-5">
               {autoPayoutBanner ? (
                 <div
@@ -149,7 +232,7 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
                 </p>
               ) : null}
 
-              <div className="rounded-[28px] border border-[#ece8df] bg-[#f7f5f0] p-7 shadow-[0_10px_24px_rgba(0,0,0,0.04)]">
+              <div className="rounded-[24px] border border-[#ece8df] bg-[#f7f5f0] p-5 shadow-[0_10px_24px_rgba(0,0,0,0.04)] sm:rounded-[28px] sm:p-7">
                 <div className="flex justify-center">
                   <div className="grid h-14 w-14 place-items-center rounded-full bg-[#c5a51f] text-[#1f232b]">
                     <Check className="h-7 w-7" strokeWidth={2.8} />
@@ -163,14 +246,14 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
                 <p className="mt-4 text-center text-[10px] font-semibold uppercase tracking-[0.12em] text-[#8d949f]">
                   Auto protection — zero touch
                 </p>
-                <h1 className="mt-4 text-center text-[40px] font-semibold leading-[0.95] text-[#1f252f] sm:text-[46px]">
+                <h1 className="mt-4 text-center text-[34px] font-semibold leading-[0.95] text-[#1f252f] sm:text-[40px] md:text-[46px]">
                   {summaryLoading && !loadError
                     ? 'Loading…'
                     : hasClaims
                       ? 'Claims & coverage'
                       : 'No claims yet'}
                 </h1>
-                <p className="mx-auto mt-3 max-w-[420px] text-center text-[15px] leading-[1.45] text-[#67707d]">
+                <p className="mx-auto mt-3 max-w-[420px] text-center text-[14px] leading-[1.45] text-[#67707d] sm:text-[15px]">
                   Extreme weather (heavy rain, severe AQI, extreme heat, or severe wind) triggers an automatic
                   payout when your subscription is active. No action required.
                 </p>
@@ -265,7 +348,7 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
                               </span>
                             </p>
                             {c.razorpayPayoutId ? (
-                              <p className="mt-0.5 font-mono text-[10px] text-[#9a9ca3]">
+                              <p className="mt-0.5 break-all font-mono text-[10px] text-[#9a9ca3]">
                                 {c.razorpayPayoutId}
                               </p>
                             ) : null}
@@ -282,38 +365,41 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
                   )}
                 </div>
               </div>
-            </section>
 
-            {import.meta.env.DEV ? (
-              <div className="mx-auto mt-8 flex w-full max-w-[640px] justify-center px-6">
-                <div className="flex w-full max-w-[280px] flex-col items-start gap-3 text-left text-[12px] text-[#4a5568]">
-                  <p className="text-[11px] leading-relaxed text-[#5c6573]">
-                    Local dev: clear stored claims and restore full coverage for testing. Requires{' '}
-                    <code className="rounded bg-[#eceff3] px-1 font-mono text-[10px] text-[#3d4652]">
-                      PAYNEST_CLAIM_SIMULATOR=true
-                    </code>{' '}
-                    on the API.
-                  </p>
+              <div className="mt-6 px-1 text-[12px] text-[#4f5b6b]">
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    disabled={testBusy || !token}
+                    onClick={() => runTestAutoClaim({ forceFraudBlock: true, manualReviewApprove: false })}
+                    className="h-8 rounded-lg border border-[#5f7088] bg-white px-3 text-[12px] font-semibold text-[#3f4d61] disabled:opacity-50"
+                  >
+                    {testBusy ? 'Running…' : 'Fraud detected claim'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={testBusy || !token}
+                    onClick={() => runTestAutoClaim({ forceFraudBlock: false, manualReviewApprove: true })}
+                    className="h-8 rounded-lg border border-[#4f7f5f] bg-white px-3 text-[12px] font-semibold text-[#2f6f46] disabled:opacity-50"
+                  >
+                    {testBusy ? 'Running…' : 'No fraud detected claim'}
+                  </button>
                   <button
                     type="button"
                     disabled={resetBusy || !token}
                     onClick={runClaimReset}
-                    className="h-9 w-full rounded-lg border border-[#8b5a5a] bg-white px-4 text-[12px] font-semibold text-[#8b3a3a] disabled:opacity-50 sm:w-auto"
+                    className="h-8 rounded-lg border border-[#8b5a5a] bg-white px-3 text-[12px] font-semibold text-[#8b3a3a] disabled:opacity-50"
                   >
-                    {resetBusy ? 'Resetting…' : 'Reset claim history'}
+                    {resetBusy ? 'Resetting…' : 'Reset claims'}
                   </button>
-                  {resetMsg ? (
-                    <p
-                      className={`text-[11px] ${
-                        /cleared|available again/i.test(resetMsg) ? 'text-[#2a6b3c]' : 'text-[#a34b2a]'
-                      }`}
-                    >
-                      {resetMsg}
-                    </p>
-                  ) : null}
                 </div>
+                {testBusy ? (
+                  <p className="mt-2 text-center text-[11px] text-[#6b7483]">Running auto test-claim…</p>
+                ) : null}
+                {testMsg ? <p className="mt-1 break-words text-center text-[11px] text-[#596577]">{testMsg}</p> : null}
               </div>
-            ) : null}
+            </section>
+
           </main>
 
           <div className="pb-5 text-center text-[11px] text-[#6d7480]">
@@ -324,8 +410,8 @@ function ClaimsPage({ userName, user, onLogout, token, onUserRefresh }) {
           </div>
 
           <footer className="border-t border-[#ebe8e2]">
-            <div className="flex flex-col gap-4 px-6 py-5 text-[12px] text-[#676e79] md:flex-row md:items-center md:justify-between lg:px-8">
-              <div className="flex gap-6">
+            <div className="flex flex-col gap-4 px-4 py-5 text-[12px] text-[#676e79] md:flex-row md:items-center md:justify-between sm:px-6 lg:px-8">
+              <div className="flex flex-wrap gap-4 sm:gap-6">
                 <p className="font-semibold text-[#444c59]">PayNest AI</p>
                 <a href="#" className="hover:text-[#2f3640]">
                   Privacy Policy
